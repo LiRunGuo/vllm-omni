@@ -559,38 +559,49 @@ def block_sparse_attention(
     key = key.view(blocked_shape)
     value = value.view(blocked_shape)
 
-    # key_valid[b, j] is False for padded positions (only in the last block).
-    key_valid = torch.ones(num_blocks, block_size, dtype=torch.bool, device=query.device)
-    if pad:
-        key_valid[-1, block_size - pad :] = False
+    # Some key is masked only when the last block is padded or a neighbour
+    # block is shifted past either end, both known from these Python ints, so
+    # the mask decision needs no device sync.
+    has_neighbours = look_backward_block > 0 or look_ahead_block > 0
+    key_valid = None
+    if pad or has_neighbours:
+        # key_valid[b, j] is False for padded positions (only in the last block).
+        key_valid = torch.ones(num_blocks, block_size, dtype=torch.bool, device=query.device)
+        if pad:
+            key_valid[-1, block_size - pad :] = False
 
-    keys, values, valids = [], [], []
-    for offset in range(-look_backward_block, look_ahead_block + 1):
-        # Key block i + offset for each query block i; blocks past either end
-        # are zero-filled and masked out.
-        shifted_key = torch.zeros_like(key)
-        shifted_value = torch.zeros_like(value)
-        valid = torch.zeros_like(key_valid)
-        if offset >= 0:
-            shifted_key[:, :, : num_blocks - offset] = key[:, :, offset:]
-            shifted_value[:, :, : num_blocks - offset] = value[:, :, offset:]
-            valid[: num_blocks - offset] = key_valid[offset:]
-        else:
-            shifted_key[:, :, -offset:] = key[:, :, : num_blocks + offset]
-            shifted_value[:, :, -offset:] = value[:, :, : num_blocks + offset]
-            valid[-offset:] = key_valid[: num_blocks + offset]
-        keys.append(shifted_key)
-        values.append(shifted_value)
-        valids.append(valid)
-
-    if len(keys) == 1:
+    if not has_neighbours:
+        # Own block only (most layers): attend to the blocked keys directly.
         keys, values, valid = key, value, key_valid
     else:
+        keys, values, valids = [], [], []
+        for offset in range(-look_backward_block, look_ahead_block + 1):
+            if offset == 0:
+                keys.append(key)
+                values.append(value)
+                valids.append(key_valid)
+                continue
+            # Key block i + offset for each query block i; blocks past either
+            # end are zero-filled and masked out.
+            shifted_key = torch.zeros_like(key)
+            shifted_value = torch.zeros_like(value)
+            valid = torch.zeros_like(key_valid)
+            if offset > 0:
+                shifted_key[:, :, : num_blocks - offset] = key[:, :, offset:]
+                shifted_value[:, :, : num_blocks - offset] = value[:, :, offset:]
+                valid[: num_blocks - offset] = key_valid[offset:]
+            else:
+                shifted_key[:, :, -offset:] = key[:, :, : num_blocks + offset]
+                shifted_value[:, :, -offset:] = value[:, :, : num_blocks + offset]
+                valid[-offset:] = key_valid[: num_blocks + offset]
+            keys.append(shifted_key)
+            values.append(shifted_value)
+            valids.append(valid)
         keys = torch.cat(keys, dim=3)
         values = torch.cat(values, dim=3)
         valid = torch.cat(valids, dim=1)
     # Every query block keeps at least its own block, so no row is fully masked.
-    mask = None if bool(valid.all()) else valid.view(1, 1, num_blocks, 1, -1)
+    mask = None if valid is None else valid.view(1, 1, num_blocks, 1, -1)
 
     out = F.scaled_dot_product_attention(query, keys, values, attn_mask=mask)
     return out.reshape(batch_size, num_heads, num_blocks * block_size, head_dim)[:, :, :seq_len]
